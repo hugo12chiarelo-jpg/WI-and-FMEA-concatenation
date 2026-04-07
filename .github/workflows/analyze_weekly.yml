@@ -28,7 +28,7 @@ jobs:
 
       - name: Run FMEA analysis with DeepSeek Reasoner
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.API_KEY_DS }}
+          API_KEY_DS: ${{ secrets.API_KEY_DS }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python scripts/analyze_fmea.py
 
