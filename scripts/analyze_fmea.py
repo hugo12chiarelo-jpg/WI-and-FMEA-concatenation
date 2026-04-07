@@ -86,7 +86,10 @@ def create_github_issue(title, body, labels=None):
 # --- Load data ---
 def load_data():
     try:
-        wi_files = glob.glob(os.path.join(WI_DIR, "*.xlsx"))
+        wi_files = [
+            f for f in glob.glob(os.path.join(WI_DIR, "*.xlsx"))
+            if not os.path.basename(f).startswith("~$")
+        ]
         if not wi_files:
             print(f"Error loading data: no .xlsx files found in '{WI_DIR}'")
             sys.exit(1)
