@@ -26,6 +26,15 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: Validate required secrets
+        run: |
+          if [ -z "$API_KEY_DS" ]; then
+            echo "::error::Required secret API_KEY_DS is not set. Go to Settings → Secrets and variables → Actions and add your DeepSeek API key as a secret named API_KEY_DS."
+            exit 1
+          fi
+        env:
+          API_KEY_DS: ${{ secrets.API_KEY_DS }}
+
       - name: Run FMEA analysis with DeepSeek Reasoner
         env:
           API_KEY_DS: ${{ secrets.API_KEY_DS }}
