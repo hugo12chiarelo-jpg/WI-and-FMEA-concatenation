@@ -1,3 +1,4 @@
+import glob
 import os
 import sys
 import json
@@ -18,10 +19,10 @@ client = OpenAI(api_key=API_KEY_DS, base_url="https://api.deepseek.com")
 
 # File paths
 # Input files must be placed in the data/ folder of this repository:
-#   - Work Instruction: data/work_instruction.xlsx
-#   - FMEA:            data/fmea.xlsx
-WI_PATH = "data/work_instruction.xlsx"
-FMEA_PATH = "data/fmea.xlsx"
+#   - Work Instructions: data/work instruction/*.xlsx  (all .xlsx files in the folder)
+#   - FMEA:              data/FMEA_COCE CENTRIFUGAL COMPRESSOR.xlsx
+WI_DIR = "data/work instruction"
+FMEA_PATH = "data/FMEA_COCE CENTRIFUGAL COMPRESSOR.xlsx"
 OUTPUT_PATH = "results/analysis.json"
 ISSUES_LABEL = "failure-mechanism-gap"  # Label for auto-created issues
 
@@ -85,9 +86,16 @@ def create_github_issue(title, body, labels=None):
 # --- Load data ---
 def load_data():
     try:
-        df_wi = pd.read_excel(WI_PATH)
+        wi_files = [
+            f for f in glob.glob(os.path.join(WI_DIR, "*.xlsx"))
+            if not os.path.basename(f).startswith("~$")
+        ]
+        if not wi_files:
+            print(f"Error loading data: no .xlsx files found in '{WI_DIR}'")
+            sys.exit(1)
+        df_wi = pd.concat([pd.read_excel(f) for f in wi_files], ignore_index=True)
         df_fmea = pd.read_excel(FMEA_PATH)
-        print("✓ Data loaded successfully.")
+        print(f"✓ Data loaded successfully ({len(wi_files)} Work Instruction file(s)).")
         return df_wi, df_fmea
     except Exception as e:
         print(f"Error loading data: {e}")
