@@ -2,9 +2,10 @@ import glob
 import os
 import sys
 import json
+import time
 import requests
 import pandas as pd
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APIStatusError, RateLimitError
 
 # --- Configuration ---
 API_KEY_DS = os.environ.get("API_KEY_DS")
@@ -15,7 +16,7 @@ if not API_KEY_DS:
     print("Error: API_KEY_DS environment variable not set.")
     sys.exit(1)
 
-client = OpenAI(api_key=API_KEY_DS, base_url="https://api.deepseek.com")
+client = OpenAI(api_key=API_KEY_DS, base_url="https://api.deepseek.com", timeout=120.0)
 
 # File paths
 # Input files must be placed in the data/ folder of this repository:
@@ -143,31 +144,55 @@ Only output valid JSON, no extra text.
 
 
 # --- Call DeepSeek Reasoner API ---
-def call_deepseek(prompt):
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-reasoner",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a maintenance reliability expert. Output only valid JSON.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-        )
-        print("✓ DeepSeek Reasoner analysis complete.")
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f"Error calling DeepSeek API: {e}")
-        sys.exit(1)
+def call_deepseek(prompt, max_retries=3):
+    """Call the DeepSeek Reasoner API with retry/backoff on transient errors.
+
+    Note: ``deepseek-reasoner`` does NOT support the ``response_format``
+    parameter, so JSON is requested via the prompt only.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a maintenance reliability expert. Output only valid JSON.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            print("✓ DeepSeek Reasoner analysis complete.")
+            return response.choices[0].message.content
+        except (APIConnectionError, RateLimitError) as e:
+            if attempt < max_retries:
+                wait = 2 ** attempt  # exponential backoff: 2 s, 4 s, 8 s (attempts 1–3)
+                print(f"⚠ DeepSeek API error (attempt {attempt}/{max_retries}): {e}. Retrying in {wait}s…")
+                time.sleep(wait)
+            else:
+                print(f"Error calling DeepSeek API: {e}")
+                sys.exit(1)
+        except APIStatusError as e:
+            print(f"Error calling DeepSeek API: HTTP {e.status_code} - {e.message}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error calling DeepSeek API: {e}")
+            sys.exit(1)
 
 
 # --- Save results and create issues ---
 def process_results(json_str):
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     try:
-        data = json.loads(json_str)
+        # Strip optional markdown code fences the model may add (e.g. ```json … ```)
+        cleaned = json_str.strip()
+        if cleaned.startswith("```"):
+            # Remove opening fence (```json or ```)
+            cleaned = cleaned.split("\n", 1)[-1]
+            # Remove closing fence
+            if cleaned.endswith("```"):
+                cleaned = cleaned.rsplit("```", 1)[0]
+        data = json.loads(cleaned)
         with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
         print(f"✓ Results saved to {OUTPUT_PATH}")
