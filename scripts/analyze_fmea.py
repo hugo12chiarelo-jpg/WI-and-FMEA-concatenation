@@ -3,14 +3,14 @@ import os
 import sys
 import json
 import time
-import requests
 import pandas as pd
 from openai import OpenAI, APIConnectionError, APIStatusError, RateLimitError
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 # --- Configuration ---
 API_KEY_DS = os.environ.get("API_KEY_DS")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # Automatically provided in GitHub Actions
-REPO = os.environ.get("GITHUB_REPOSITORY")     # Format: "owner/repo"
 
 if not API_KEY_DS:
     print("Error: API_KEY_DS environment variable not set.")
@@ -21,67 +21,45 @@ client = OpenAI(api_key=API_KEY_DS, base_url="https://api.deepseek.com", timeout
 # File paths
 # Input files must be placed in the data/ folder of this repository:
 #   - Work Instructions: data/work instruction/*.xlsx  (all .xlsx files in the folder)
-#   - FMEA:              data/FMEA_COCE CENTRIFUGAL COMPRESSOR.xlsx
+#   - FMEA:              any single .xlsx file in the data/ folder (not inside a subdirectory)
 WI_DIR = "data/work instruction"
-FMEA_PATH = "data/FMEA_COCE CENTRIFUGAL COMPRESSOR.xlsx"
-OUTPUT_PATH = "results/analysis.json"
-ISSUES_LABEL = "failure-mechanism-gap"  # Label for auto-created issues
+DATA_DIR = "data"
+OUTPUT_PATH = "results/analysis.xlsx"
+
+# FMEA spreadsheet column names that hold the maintainable item and failure mechanism
+FMEA_COL_ITEM = "Unnamed: 6"
+FMEA_COL_MECHANISM = "Unnamed: 7"
+
+# Coverage colour fills
+FILL_COVERED = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
+FILL_PARTIAL = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
+FILL_NOT_COVERED = PatternFill(start_color="FF4444", end_color="FF4444", fill_type="solid")
+
+# Header colour fill (teal, matching the example image)
+FILL_HEADER = PatternFill(start_color="1F6B75", end_color="1F6B75", fill_type="solid")
+FONT_HEADER = Font(bold=True, color="FFFFFF")
+
+THIN_BORDER = Border(
+    left=Side(style="thin"),
+    right=Side(style="thin"),
+    top=Side(style="thin"),
+    bottom=Side(style="thin"),
+)
 
 
-# --- Helper: Check if issue already exists ---
-def issue_exists(title):
-    """Return True if an open issue with the given title already exists.
-
-    Paginates through all open issues with the label to avoid false negatives
-    when there are more than 100 existing issues.
-    """
-    if not GITHUB_TOKEN or not REPO:
-        return False
-    page = 1
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    while True:
-        url = (
-            f"https://api.github.com/repos/{REPO}/issues"
-            f"?state=open&labels={ISSUES_LABEL}&per_page=100&page={page}"
-        )
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            return False
-        issues = response.json()
-        if not issues:
-            break
-        if any(issue["title"] == title for issue in issues):
-            return True
-        page += 1
-    return False
-
-
-# --- Helper: Create GitHub Issue ---
-def create_github_issue(title, body, labels=None):
-    """Create an issue in the repository using the GitHub API."""
-    if not GITHUB_TOKEN or not REPO:
-        print("Skipping issue creation: missing GITHUB_TOKEN or REPO")
-        return
-
-    if issue_exists(title):
-        print(f"↷ Issue already exists, skipping: {title}")
-        return
-
-    url = f"https://api.github.com/repos/{REPO}/issues"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json",
-    }
-    data = {
-        "title": title,
-        "body": body,
-        "labels": labels or [ISSUES_LABEL],
-    }
-    response = requests.post(url, json=data, headers=headers)
-    if response.status_code == 201:
-        print(f"✓ Issue created: {title}")
-    else:
-        print(f"✗ Failed to create issue: {response.status_code} - {response.text}")
+# --- Locate FMEA file dynamically ---
+def find_fmea_file():
+    """Return the path to the single FMEA .xlsx file located directly inside DATA_DIR."""
+    candidates = [
+        f for f in glob.glob(os.path.join(DATA_DIR, "*.xlsx"))
+        if not os.path.basename(f).startswith("~$")
+    ]
+    if not candidates:
+        print(f"Error: no .xlsx FMEA file found in '{DATA_DIR}'")
+        sys.exit(1)
+    if len(candidates) > 1:
+        print(f"Warning: multiple .xlsx files found in '{DATA_DIR}', using: {candidates[0]}")
+    return candidates[0]
 
 
 # --- Load data ---
@@ -94,51 +72,105 @@ def load_data():
         if not wi_files:
             print(f"Error loading data: no .xlsx files found in '{WI_DIR}'")
             sys.exit(1)
+
         df_wi = pd.concat([pd.read_excel(f) for f in wi_files], ignore_index=True)
-        df_fmea = pd.read_excel(FMEA_PATH)
-        print(f"✓ Data loaded successfully ({len(wi_files)} Work Instruction file(s)).")
+
+        fmea_path = find_fmea_file()
+        df_fmea = pd.read_excel(fmea_path)
+        print(
+            f"✓ Data loaded: FMEA '{os.path.basename(fmea_path)}', "
+            f"{len(wi_files)} Work Instruction file(s)."
+        )
         return df_wi, df_fmea
+    except SystemExit:
+        raise
     except Exception as e:
         print(f"Error loading data: {e}")
         sys.exit(1)
 
 
+# --- Extract FMEA component/mechanism pairs ---
+def extract_fmea_rows(df_fmea):
+    """Parse the FMEA spreadsheet and return a list of dicts with
+    'maintainable_item' and 'failure_mechanism', skipping header/total rows."""
+    rows = []
+    current_item = None
+    for _, row in df_fmea.iterrows():
+        item_val = row.get(FMEA_COL_ITEM)
+        mech_val = row.get(FMEA_COL_MECHANISM)
+
+        # Skip pure header row
+        if str(item_val).strip() == "Maintainable Item":
+            continue
+
+        # A non-null item cell starts a new component group (ignore "* Total" rows)
+        if pd.notna(item_val):
+            label = str(item_val).strip()
+            if "Total" in label or label == "Grand Total":
+                current_item = None
+                continue
+            current_item = label
+
+        # A mechanism cell with a valid current component is a data row
+        if current_item and pd.notna(mech_val):
+            rows.append(
+                {
+                    "maintainable_item": current_item,
+                    "failure_mechanism": str(mech_val).strip(),
+                }
+            )
+    return rows
+
+
 # --- Build prompt for deepseek-reasoner ---
-def build_prompt(df_wi, df_fmea):
-    wi_sample = df_wi.head(100).to_string()
-    fmea_sample = df_fmea.head(100).to_string()
+def build_prompt(df_wi, fmea_rows):
+    wi_text = df_wi.to_string()
+
+    fmea_lines = "\n".join(
+        f"- {r['maintainable_item']} | {r['failure_mechanism']}"
+        for r in fmea_rows
+    )
 
     prompt = f"""
 You are a maintenance engineering expert specialized in rotating equipment and ISO 14224 failure classification.
 
 You have two datasets:
 
-1. **Current Maintenance Strategy (Reporting Questions):**
+1. **Work Instructions – Reporting Questions (all rows):**
 ```
-{wi_sample}
+{wi_text}
 ```
 
-2. **FMEA Failure Mode Tree (from ISO 14224):**
+2. **FMEA – All Maintainable Items and Failure Mechanisms to analyse:**
 ```
-{fmea_sample}
+{fmea_lines}
 ```
 
 **Task:**
-For each failure mechanism listed in the FMEA, determine whether it is covered by any reporting question in the strategy.
+For EVERY failure mechanism listed above, determine whether it is covered by any reporting question
+in the Work Instructions. You MUST return one entry per line in the FMEA list — do not skip any.
 
-**Coverage classification:**
-- "Covered": A question directly or functionally detects or prevents that failure mechanism.
-- "Partial": A question indirectly indicates the mechanism but not reliably or not directly.
-- "Not covered": No question addresses that mechanism.
+**Coverage classification rules:**
+- "Covered": A reporting question directly or functionally identifies, detects, or prevents that
+  failure mechanism. This includes: a question that explicitly mentions the phenomenon (e.g.,
+  "corrosion" → covers Corrosion), a question linked to a component that is functionally
+  responsible for the mechanism, or a question that monitors a symptom that is a direct
+  consequence of the mechanism.
+- "Partial": A question may indicate the mechanism indirectly or unreliably — e.g., a generic
+  vibration question that could relate to multiple mechanisms, or a question on a nearby component
+  rather than the exact component.
+- "Not covered": No reporting question, even indirectly, can detect or prevent the mechanism.
 
-**Output format:** Return a JSON object with an array called "analysis". Each element must have:
-- "component": the maintainable item from FMEA
-- "symptom": the symptom (if available)
-- "failure_mechanism": the mechanism name
+**Output format:** Return a JSON object with a top-level array called "analysis".
+Each element MUST have exactly these fields:
+- "maintainable_item": the component name (from the FMEA list)
+- "failure_mechanism": the failure mechanism name (from the FMEA list)
 - "coverage": one of "Covered", "Partial", "Not covered"
-- "justification": a short explanation
+- "note": a brief justification in the same language as the Work Instructions data
+- "question_ids": a list of WTT IDs or question task numbers that support the coverage
+  (empty list [] if Not covered)
 
-Only output valid JSON, no extra text.
+Only output valid JSON, no extra text, no markdown fences.
 """
     return prompt
 
@@ -180,46 +212,122 @@ def call_deepseek(prompt, max_retries=3):
             sys.exit(1)
 
 
-# --- Save results and create issues ---
-def process_results(json_str):
+# --- Save results as Excel workbook ---
+def save_excel(analysis_items):
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "FMEA Coverage Analysis"
+
+    headers = [
+        "Maintainable Item (FMEA)",
+        "Failure Mechanism",
+        "Coverage",
+        "Note",
+        "Reporting Question ID identification",
+    ]
+
+    # Write and style header row
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = FILL_HEADER
+        cell.font = FONT_HEADER
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = THIN_BORDER
+
+    ws.row_dimensions[1].height = 30
+
+    # Write data rows
+    for row_idx, item in enumerate(analysis_items, start=2):
+        coverage = item.get("coverage", "")
+        question_ids = item.get("question_ids", [])
+        ids_str = ", ".join(str(q) for q in question_ids) if question_ids else ""
+
+        values = [
+            item.get("maintainable_item", ""),
+            item.get("failure_mechanism", ""),
+            coverage,
+            item.get("note", ""),
+            ids_str,
+        ]
+
+        for col_idx, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            cell.border = THIN_BORDER
+
+        # Apply coverage colour to the Coverage cell (column C)
+        cov_cell = ws.cell(row=row_idx, column=3)
+        if coverage == "Covered":
+            cov_cell.fill = FILL_COVERED
+            cov_cell.font = Font(bold=True, color="FFFFFF")
+        elif coverage == "Partial":
+            cov_cell.fill = FILL_PARTIAL
+            cov_cell.font = Font(bold=True, color="000000")
+        elif coverage == "Not covered":
+            cov_cell.fill = FILL_NOT_COVERED
+            cov_cell.font = Font(bold=True, color="FFFFFF")
+
+        cov_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Set column widths
+    col_widths = [30, 35, 15, 60, 35]
+    for col_idx, width in enumerate(col_widths, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    # Freeze the header row
+    ws.freeze_panes = "A2"
+
+    # Auto-filter on all columns
+    ws.auto_filter.ref = ws.dimensions
+
+    wb.save(OUTPUT_PATH)
+    print(f"✓ Results saved to {OUTPUT_PATH}")
+
+
+# --- Parse API response and save ---
+def process_results(json_str, fmea_rows):
     try:
         # Strip optional markdown code fences the model may add (e.g. ```json … ```)
         cleaned = json_str.strip()
         if cleaned.startswith("```"):
-            # Remove opening fence (```json or ```)
             cleaned = cleaned.split("\n", 1)[-1]
-            # Remove closing fence
             if cleaned.endswith("```"):
                 cleaned = cleaned.rsplit("```", 1)[0]
+
         data = json.loads(cleaned)
-        with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-        print(f"✓ Results saved to {OUTPUT_PATH}")
+        analysis = data.get("analysis", [])
 
-        # Identify uncovered mechanisms
-        uncovered = [
-            item
-            for item in data.get("analysis", [])
-            if item.get("coverage") == "Not covered"
-        ]
-        print(f"Found {len(uncovered)} uncovered failure mechanisms.")
+        # Ensure every FMEA row is represented; add placeholder if AI missed any
+        ai_keys = {
+            (str(e.get("maintainable_item", "")).strip(),
+             str(e.get("failure_mechanism", "")).strip())
+            for e in analysis
+        }
+        for fmea_row in fmea_rows:
+            key = (str(fmea_row["maintainable_item"]).strip(),
+                   str(fmea_row["failure_mechanism"]).strip())
+            if key not in ai_keys:
+                analysis.append(
+                    {
+                        "maintainable_item": fmea_row["maintainable_item"],
+                        "failure_mechanism": fmea_row["failure_mechanism"],
+                        "coverage": "Not covered",
+                        "note": "No analysis returned by AI for this mechanism.",
+                        "question_ids": [],
+                    }
+                )
 
-        # Create an issue for each uncovered mechanism (skip duplicates)
-        for item in uncovered:
-            title = f"[GAP] {item['component']} - {item['failure_mechanism']}"
-            body = f"""## Uncovered Failure Mechanism
+        covered = sum(1 for e in analysis if e.get("coverage") == "Covered")
+        partial = sum(1 for e in analysis if e.get("coverage") == "Partial")
+        not_covered = sum(1 for e in analysis if e.get("coverage") == "Not covered")
+        print(
+            f"Summary: {len(analysis)} mechanisms — "
+            f"{covered} Covered, {partial} Partial, {not_covered} Not covered."
+        )
 
-**Component:** {item['component']}
-**Symptom:** {item.get('symptom', 'N/A')}
-**Failure Mechanism:** {item['failure_mechanism']}
-
-**Justification from analysis:**
-{item['justification']}
-
-**Recommendation:** Consider adding a reporting question or inspection to detect this mechanism.
-"""
-            create_github_issue(title, body)
+        save_excel(analysis)
 
     except json.JSONDecodeError:
         print("Error: API response is not valid JSON.")
@@ -232,9 +340,11 @@ def process_results(json_str):
 def main():
     print("--- FMEA Coverage Analysis with DeepSeek Reasoner ---")
     df_wi, df_fmea = load_data()
-    prompt = build_prompt(df_wi, df_fmea)
+    fmea_rows = extract_fmea_rows(df_fmea)
+    print(f"✓ Extracted {len(fmea_rows)} FMEA component/mechanism pairs.")
+    prompt = build_prompt(df_wi, fmea_rows)
     result_json = call_deepseek(prompt)
-    process_results(result_json)
+    process_results(result_json, fmea_rows)
     print("--- Analysis finished ---")
 
 

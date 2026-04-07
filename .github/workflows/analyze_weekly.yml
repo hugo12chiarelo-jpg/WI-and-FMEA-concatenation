@@ -5,10 +5,6 @@ on:
     - cron: '0 9 * * 1'  # Every Monday at 09:00 UTC
   workflow_dispatch:
 
-# Required to create issues
-permissions:
-  issues: write
-
 jobs:
   run-analysis:
     runs-on: ubuntu-latest
@@ -38,11 +34,10 @@ jobs:
       - name: Run FMEA analysis with DeepSeek Reasoner
         env:
           API_KEY_DS: ${{ secrets.API_KEY_DS }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python scripts/analyze_fmea.py
 
       - name: Upload analysis result
         uses: actions/upload-artifact@v4
         with:
           name: fmea-coverage-report
-          path: results/analysis.json
+          path: results/analysis.xlsx
