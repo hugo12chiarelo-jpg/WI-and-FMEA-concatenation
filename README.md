@@ -12,5 +12,15 @@ Place the input files in the `data/` folder of this repository before running th
 
 ## Configuration
 
+> ⚠️ **The workflow will fail if `API_KEY_DS` is not configured.**
+
 The workflow uses the repository secret **`API_KEY_DS`** as the DeepSeek API key.  
-Make sure to add this secret under *Settings → Secrets and variables → Actions* in your repository.
+Follow these steps to add it:
+
+1. Go to your repository on GitHub.
+2. Click **Settings** → **Secrets and variables** → **Actions**.
+3. Click **New repository secret**.
+4. Set the name to `API_KEY_DS` and paste your DeepSeek API key as the value.
+5. Click **Add secret**.
+
+Once the secret is saved, re-run the workflow — the `Error: API_KEY_DS environment variable not set.` error will no longer appear.
