@@ -6,18 +6,21 @@ import pandas as pd
 from openai import OpenAI
 
 # --- Configuration ---
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+API_KEY_DS = os.environ.get("API_KEY_DS")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # Automatically provided in GitHub Actions
 REPO = os.environ.get("GITHUB_REPOSITORY")     # Format: "owner/repo"
 
-if not DEEPSEEK_API_KEY:
-    print("Error: DEEPSEEK_API_KEY environment variable not set.")
+if not API_KEY_DS:
+    print("Error: API_KEY_DS environment variable not set.")
     sys.exit(1)
 
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+client = OpenAI(api_key=API_KEY_DS, base_url="https://api.deepseek.com")
 
 # File paths
-STRATEGY_PATH = "data/strategy.xlsx"
+# Input files must be placed in the data/ folder of this repository:
+#   - Work Instruction: data/work_instruction.xlsx
+#   - FMEA:            data/fmea.xlsx
+WI_PATH = "data/work_instruction.xlsx"
 FMEA_PATH = "data/fmea.xlsx"
 OUTPUT_PATH = "results/analysis.json"
 ISSUES_LABEL = "failure-mechanism-gap"  # Label for auto-created issues
@@ -82,18 +85,18 @@ def create_github_issue(title, body, labels=None):
 # --- Load data ---
 def load_data():
     try:
-        df_strategy = pd.read_excel(STRATEGY_PATH)
+        df_wi = pd.read_excel(WI_PATH)
         df_fmea = pd.read_excel(FMEA_PATH)
         print("✓ Data loaded successfully.")
-        return df_strategy, df_fmea
+        return df_wi, df_fmea
     except Exception as e:
         print(f"Error loading data: {e}")
         sys.exit(1)
 
 
 # --- Build prompt for deepseek-reasoner ---
-def build_prompt(df_strategy, df_fmea):
-    strategy_sample = df_strategy.head(100).to_string()
+def build_prompt(df_wi, df_fmea):
+    wi_sample = df_wi.head(100).to_string()
     fmea_sample = df_fmea.head(100).to_string()
 
     prompt = f"""
@@ -103,7 +106,7 @@ You have two datasets:
 
 1. **Current Maintenance Strategy (Reporting Questions):**
 ```
-{strategy_sample}
+{wi_sample}
 ```
 
 2. **FMEA Failure Mode Tree (from ISO 14224):**
@@ -195,8 +198,8 @@ def process_results(json_str):
 # --- Main ---
 def main():
     print("--- FMEA Coverage Analysis with DeepSeek Reasoner ---")
-    df_strategy, df_fmea = load_data()
-    prompt = build_prompt(df_strategy, df_fmea)
+    df_wi, df_fmea = load_data()
+    prompt = build_prompt(df_wi, df_fmea)
     result_json = call_deepseek(prompt)
     process_results(result_json)
     print("--- Analysis finished ---")
