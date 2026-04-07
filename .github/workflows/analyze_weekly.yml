@@ -1,0 +1,39 @@
+name: FMEA Coverage Analysis
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 09:00 UTC
+  workflow_dispatch:
+
+# Required to create issues
+permissions:
+  issues: write
+
+jobs:
+  run-analysis:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run FMEA analysis with DeepSeek Reasoner
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.API_KEY_DS }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/analyze_fmea.py
+
+      - name: Upload analysis result
+        uses: actions/upload-artifact@v4
+        with:
+          name: fmea-coverage-report
+          path: results/analysis.json
