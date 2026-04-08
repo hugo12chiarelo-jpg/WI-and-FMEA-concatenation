@@ -29,6 +29,9 @@ OUTPUT_PATH = "results/analysis.xlsx"
 # FMEA spreadsheet column names that hold the maintainable item and failure mechanism
 FMEA_COL_ITEM = "Unnamed: 6"
 FMEA_COL_MECHANISM = "Unnamed: 7"
+# FMEA left-table columns: component names and symptom codes
+FMEA_COL_LEFT_LABEL = "Unnamed: 3"
+FMEA_COL_LEFT_GROUP = "Unnamed: 0"
 
 # Coverage colour fills
 FILL_COVERED = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
@@ -73,15 +76,13 @@ def load_data():
             print(f"Error loading data: no .xlsx files found in '{WI_DIR}'")
             sys.exit(1)
 
-        df_wi = pd.concat([pd.read_excel(f) for f in wi_files], ignore_index=True)
-
         fmea_path = find_fmea_file()
         df_fmea = pd.read_excel(fmea_path)
         print(
             f"✓ Data loaded: FMEA '{os.path.basename(fmea_path)}', "
             f"{len(wi_files)} Work Instruction file(s)."
         )
-        return df_wi, df_fmea
+        return wi_files, df_fmea
     except SystemExit:
         raise
     except Exception as e:
@@ -89,10 +90,107 @@ def load_data():
         sys.exit(1)
 
 
+# --- Prepare WI questions with unique IDs ---
+def prepare_wi_questions(wi_files):
+    """Load all WI files and return a list of dicts, each with a unique question_id.
+
+    ID format (in priority order):
+      1. If an 'Unnamed: 4' column exists and contains a value like 'PM00248A-Q4', use it directly.
+      2. Otherwise construct '{WTT_ID}-{Work instruction task}', e.g. 'PM00009A-2.d'.
+         The WTT_ID is taken from the 'WTT ID' column (forward-filled) or, when absent/NaN,
+         from the filename stem (e.g. 'PM00072A.xlsx' → 'PM00072A').
+    """
+    questions = []
+    for filepath in wi_files:
+        df = pd.read_excel(filepath)
+        filename_wtt = os.path.splitext(os.path.basename(filepath))[0]
+
+        # Forward-fill WTT ID column so merged cells propagate
+        if "WTT ID" in df.columns:
+            df["WTT ID"] = df["WTT ID"].ffill()
+
+        for _, row in df.iterrows():
+            # --- Determine question ID ---
+            q_id = None
+
+            # Priority 1: pre-built ID in Unnamed: 4 (e.g. PM00248A-Q4)
+            if "Unnamed: 4" in df.columns:
+                val = row.get("Unnamed: 4")
+                if pd.notna(val):
+                    candidate = str(val).strip()
+                    if candidate and candidate.lower() != "nan":
+                        q_id = candidate
+
+            # Priority 2: construct from WTT ID + task number
+            if not q_id:
+                raw_wtt = row.get("WTT ID", None) if "WTT ID" in df.columns else None
+                wtt = (
+                    str(raw_wtt).strip()
+                    if pd.notna(raw_wtt) and str(raw_wtt).strip().lower() != "nan"
+                    else filename_wtt
+                )
+                task = row.get("Work instruction task", None)
+                task_str = (
+                    str(task).strip()
+                    if pd.notna(task) and str(task).strip().lower() != "nan"
+                    else ""
+                )
+                q_id = f"{wtt}-{task_str}" if task_str else wtt
+
+            # --- Extract other fields ---
+            maintainable_item = str(row.get("Maintainable Item", "")).strip()
+            reporting_question = str(row.get("Reporting Question", "")).strip()
+
+            # Skip rows with no actual reporting question
+            if not reporting_question or reporting_question.lower() == "nan":
+                continue
+
+            questions.append(
+                {
+                    "question_id": q_id,
+                    "maintainable_item": maintainable_item,
+                    "reporting_question": reporting_question,
+                }
+            )
+
+    return questions
+
+
+# --- Extract FMEA component → symptoms mapping ---
+def extract_fmea_component_symptoms(df_fmea):
+    """Parse the FMEA left-side pivot table and return a dict mapping
+    each component name to its list of symptom/failure-mode codes."""
+    # Identify all known component names from the group column
+    known_components = set(
+        str(v).strip()
+        for v in df_fmea[FMEA_COL_LEFT_GROUP].dropna().unique()
+        if str(v).strip() not in ("Row Labels", "Grand Total")
+    )
+
+    component_symptoms = {}
+    current_comp = None
+    for _, row in df_fmea.iterrows():
+        label_val = row.get(FMEA_COL_LEFT_LABEL)
+        if pd.isna(label_val):
+            continue
+        label = str(label_val).strip()
+        if not label or label in ("Row Labels", "Grand Total"):
+            continue
+        if label in known_components:
+            current_comp = label
+            component_symptoms.setdefault(current_comp, [])
+        elif current_comp and label not in known_components:
+            component_symptoms[current_comp].append(label)
+
+    return component_symptoms
+
+
 # --- Extract FMEA component/mechanism pairs ---
-def extract_fmea_rows(df_fmea):
+def extract_fmea_rows(df_fmea, component_symptoms=None):
     """Parse the FMEA spreadsheet and return a list of dicts with
-    'maintainable_item' and 'failure_mechanism', skipping header/total rows."""
+    'maintainable_item', 'failure_mechanism', and 'symptoms', skipping header/total rows."""
+    if component_symptoms is None:
+        component_symptoms = {}
     rows = []
     current_item = None
     for _, row in df_fmea.iterrows():
@@ -113,62 +211,152 @@ def extract_fmea_rows(df_fmea):
 
         # A mechanism cell with a valid current component is a data row
         if current_item and pd.notna(mech_val):
+            mech_str = str(mech_val).strip()
+            if mech_str == "Failure Mechanism":
+                continue
+            symptoms = component_symptoms.get(current_item, [])
             rows.append(
                 {
                     "maintainable_item": current_item,
-                    "failure_mechanism": str(mech_val).strip(),
+                    "failure_mechanism": mech_str,
+                    "symptoms": ", ".join(symptoms) if symptoms else "Unknown",
                 }
             )
     return rows
 
 
 # --- Build prompt for deepseek-reasoner ---
-def build_prompt(df_wi, fmea_rows):
-    wi_text = df_wi.to_string()
+def build_prompt(wi_questions, fmea_rows):
+    """Build the analysis prompt using a structured WI question list (with IDs) and FMEA rows."""
 
+    # Build a readable table of WI questions with their IDs
+    wi_lines = []
+    for q in wi_questions:
+        wi_lines.append(
+            f"  [{q['question_id']}] ({q['maintainable_item']}) {q['reporting_question']}"
+        )
+    wi_text = "\n".join(wi_lines)
+
+    # Build FMEA list with symptoms context
     fmea_lines = "\n".join(
-        f"- {r['maintainable_item']} | {r['failure_mechanism']}"
+        f"- {r['maintainable_item']} | {r['failure_mechanism']} "
+        f"| Symptoms: {r['symptoms']}"
         for r in fmea_rows
     )
 
     prompt = f"""
 You are a maintenance engineering expert specialized in rotating equipment and ISO 14224 failure classification.
+You apply Reliability-Centered Maintenance (RCM) principles to evaluate maintenance strategy coverage.
 
 You have two datasets:
 
-1. **Work Instructions – Reporting Questions (all rows):**
+1. **Work Instructions – Reporting Questions:**
+Each line follows the format: [QUESTION_ID] (Maintainable Item) Reporting Question text
 ```
 {wi_text}
 ```
 
-2. **FMEA – All Maintainable Items and Failure Mechanisms to analyse:**
+2. **FMEA – Failure Mechanisms to analyse (with observed symptoms per component):**
+Each line follows the format: Component | Failure Mechanism | Symptoms (ISO 14224 codes)
 ```
 {fmea_lines}
 ```
 
-**Task:**
+---
+
+**TASK:**
 For EVERY failure mechanism listed above, determine whether it is covered by any reporting question
-in the Work Instructions. You MUST return one entry per line in the FMEA list — do not skip any.
+in the Work Instructions. You MUST return one entry per mechanism — do not skip any.
 
-**Coverage classification rules:**
-- "Covered": A reporting question directly or functionally identifies, detects, or prevents that
-  failure mechanism. This includes: a question that explicitly mentions the phenomenon (e.g.,
-  "corrosion" → covers Corrosion), a question linked to a component that is functionally
-  responsible for the mechanism, or a question that monitors a symptom that is a direct
-  consequence of the mechanism.
-- "Partial": A question may indicate the mechanism indirectly or unreliably — e.g., a generic
-  vibration question that could relate to multiple mechanisms, or a question on a nearby component
-  rather than the exact component.
-- "Not covered": No reporting question, even indirectly, can detect or prevent the mechanism.
+---
 
-**Output format:** Return a JSON object with a top-level array called "analysis".
-Each element MUST have exactly these fields:
-- "maintainable_item": the component name (from the FMEA list)
-- "failure_mechanism": the failure mechanism name (from the FMEA list)
-- "coverage": one of "Covered", "Partial", "Not covered"
-- "note": a brief justification in the same language as the Work Instructions data
-- "question_ids": a list of WTT IDs or question task numbers that support the coverage
-  (empty list [] if Not covered)
+**COVERAGE CLASSIFICATION RULES:**
+
+- **"Covered"**: A reporting question directly or functionally identifies, detects, or prevents
+  that failure mechanism. This includes:
+  - A question that explicitly mentions the physical phenomenon (e.g., "corrosion" → covers
+    mechanism "2.2 Corrosion").
+  - A question linked to a component that is functionally responsible for the mechanism.
+  - A question that monitors a symptom that is a direct and specific consequence of the mechanism.
+
+- **"Partial"**: A question may indicate the mechanism indirectly or unreliably, for example:
+  - A generic symptom question (e.g., "unusual vibration") that could relate to multiple
+    mechanisms (misalignment, imbalance, looseness, wear, etc.).
+  - A question about a parent or nearby component rather than the exact failing component.
+  - The mechanism is only one of several causes that could trigger the observed symptom.
+
+- **"Not covered"**: Absolutely no reporting question, even indirectly, can detect or prevent
+  the mechanism. Use this only when there is truly no applicable question.
+
+---
+
+**ENGINEERING KNOWLEDGE — apply these associations:**
+- Vibration (VIB) questions → partially cover: misalignment, imbalance, looseness, wear,
+  bearing clearance failure, shaft deflection.
+- Noise (NOI) questions → partially cover: wear, erosion, looseness, bearing failure, cavitation.
+- Temperature / overheating (OHE) questions → partially cover: lack of lubrication, friction,
+  overheating, bearing failure.
+- Lube oil analysis / sampling → cover or partially cover: wear, fatigue, contamination,
+  corrosion, erosion in lubricated components.
+- Visual inspection for leaks/corrosion/damage → cover: external leakage (ELP/ELU), corrosion,
+  deformation, structural deficiency.
+- Seal gas / buffer gas parameter questions → cover or partially cover: seal-related leakage,
+  dry gas seal failure mechanisms.
+- Instrument/calibration/signal questions → cover: signal/indication failures, spurious alarms,
+  control failures, out-of-adjustment mechanisms.
+- Differential pressure questions on filters/strainers → cover: blockage/plugged mechanisms.
+
+---
+
+**FUNCTIONAL MAPPING RULES:**
+- If a question is associated with a parent component (e.g., "*Centrifugal Compressor"), it
+  applies to all sub-components (casing, bearings, impeller, shaft, diffuser, coupling) unless
+  explicitly excluded.
+- Questions about instrumentation (transmitters, panels, indicators, alarms, calibration) apply
+  to components that depend on control/signal, such as dry gas seal, anti-surge valve, lube oil
+  pump, seal gas panel.
+- A question about the lube oil system applies to all lubricated components (bearings, shaft,
+  coupling, etc.).
+- Use the Symptom codes (ISO 14224) listed for each component to associate symptom-detecting
+  questions with the corresponding failure mechanisms. A question that detects a symptom listed
+  for a component covers or partially covers all mechanisms that can produce that symptom.
+
+---
+
+**CRITERIA:**
+- Do NOT classify as "Covered" if the relation is very remote or speculative.
+- Prefer "Partial" when there is reasonable doubt.
+- Use "Not covered" only when absolutely no question addresses the mechanism.
+
+---
+
+**OUTPUT FORMAT:**
+Return a single valid JSON object (no markdown fences, no extra text) with:
+
+1. Top-level key **"analysis"**: an array where each element has exactly:
+   - "maintainable_item": component name from the FMEA list
+   - "failure_mechanism": failure mechanism from the FMEA list
+   - "coverage": one of "Covered", "Partial", "Not covered"
+   - "note": brief justification in the same language as the Work Instructions data
+   - "question_ids": list of QUESTION_IDs (from the bracketed IDs in the Work Instructions above,
+     e.g. "PM00248A-Q4", "PM00009A-2.f") that support the coverage.
+     IMPORTANT: always include the full ID including the question number
+     (e.g. "PM00009A-2.f", NOT just "PM00009A").
+     Use an empty list [] if "Not covered".
+
+2. Top-level key **"gaps"**: an array of objects for mechanisms with "Not covered" coverage:
+   - "maintainable_item": component name
+   - "failure_mechanism": mechanism name
+   - "recommendation": a brief recommendation for a new inspection task to cover this gap
+
+3. Top-level key **"excesses"**: an array of objects where multiple questions are fully redundant
+   for the same mechanism (i.e., 3 or more question_ids that all directly cover the same thing):
+   - "maintainable_item": component name
+   - "failure_mechanism": mechanism name
+   - "redundant_question_ids": list of question IDs that are redundant
+
+4. Top-level key **"recommendations"**: a string with a concise summary (3-5 bullet points) of
+   the main recommendations to improve the maintenance strategy coverage.
 
 Only output valid JSON, no extra text, no markdown fences.
 """
@@ -213,10 +401,12 @@ def call_deepseek(prompt, max_retries=3):
 
 
 # --- Save results as Excel workbook ---
-def save_excel(analysis_items):
+def save_excel(analysis_items, gaps=None, excesses=None, recommendations=""):
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
 
     wb = Workbook()
+
+    # ── Sheet 1: FMEA Coverage Analysis ──────────────────────────────────────
     ws = wb.active
     ws.title = "FMEA Coverage Analysis"
 
@@ -271,8 +461,9 @@ def save_excel(analysis_items):
 
         cov_cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # Set column widths
-    col_widths = [30, 35, 15, 60, 35]
+    # Set column widths: A=Maintainable Item, B=Failure Mechanism, C=Coverage,
+    #                    D=Note, E=Reporting Question ID identification
+    col_widths = [30, 35, 15, 60, 40]
     for col_idx, width in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
@@ -281,6 +472,75 @@ def save_excel(analysis_items):
 
     # Auto-filter on all columns
     ws.auto_filter.ref = ws.dimensions
+
+    # ── Sheet 2: Gaps ─────────────────────────────────────────────────────────
+    ws_gaps = wb.create_sheet(title="Gaps (Not Covered)")
+    gap_headers = ["Maintainable Item", "Failure Mechanism", "Recommendation"]
+    for col_idx, header in enumerate(gap_headers, start=1):
+        cell = ws_gaps.cell(row=1, column=col_idx, value=header)
+        cell.fill = FILL_HEADER
+        cell.font = FONT_HEADER
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = THIN_BORDER
+    ws_gaps.row_dimensions[1].height = 30
+
+    for row_idx, gap in enumerate(gaps or [], start=2):
+        for col_idx, key in enumerate(
+            ["maintainable_item", "failure_mechanism", "recommendation"], start=1
+        ):
+            cell = ws_gaps.cell(row=row_idx, column=col_idx, value=gap.get(key, ""))
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            cell.border = THIN_BORDER
+
+    for col_idx, width in enumerate([30, 35, 70], start=1):
+        ws_gaps.column_dimensions[get_column_letter(col_idx)].width = width
+    ws_gaps.freeze_panes = "A2"
+    if gaps:
+        ws_gaps.auto_filter.ref = ws_gaps.dimensions
+
+    # ── Sheet 3: Excesses ─────────────────────────────────────────────────────
+    ws_exc = wb.create_sheet(title="Excesses (Redundant)")
+    exc_headers = ["Maintainable Item", "Failure Mechanism", "Redundant Question IDs"]
+    for col_idx, header in enumerate(exc_headers, start=1):
+        cell = ws_exc.cell(row=1, column=col_idx, value=header)
+        cell.fill = FILL_HEADER
+        cell.font = FONT_HEADER
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = THIN_BORDER
+    ws_exc.row_dimensions[1].height = 30
+
+    for row_idx, exc in enumerate(excesses or [], start=2):
+        redundant = exc.get("redundant_question_ids", [])
+        values = [
+            exc.get("maintainable_item", ""),
+            exc.get("failure_mechanism", ""),
+            ", ".join(str(q) for q in redundant),
+        ]
+        for col_idx, value in enumerate(values, start=1):
+            cell = ws_exc.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            cell.border = THIN_BORDER
+
+    for col_idx, width in enumerate([30, 35, 60], start=1):
+        ws_exc.column_dimensions[get_column_letter(col_idx)].width = width
+    ws_exc.freeze_panes = "A2"
+    if excesses:
+        ws_exc.auto_filter.ref = ws_exc.dimensions
+
+    # ── Sheet 4: Recommendations ──────────────────────────────────────────────
+    ws_rec = wb.create_sheet(title="Recommendations")
+    rec_cell = ws_rec.cell(row=1, column=1, value="Strategic Recommendations")
+    rec_cell.fill = FILL_HEADER
+    rec_cell.font = FONT_HEADER
+    rec_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws_rec.column_dimensions["A"].width = 100
+    ws_rec.row_dimensions[1].height = 25
+
+    content_cell = ws_rec.cell(row=2, column=1, value=recommendations or "No recommendations provided.")
+    content_cell.alignment = Alignment(vertical="top", wrap_text=True)
+    # Estimate row height based on line count (each newline adds ~15 points)
+    line_count = (recommendations or "").count("\n") + 1
+    ws_rec.row_dimensions[2].height = max(30, min(line_count * 15, 400))
 
     wb.save(OUTPUT_PATH)
     print(f"✓ Results saved to {OUTPUT_PATH}")
@@ -327,7 +587,24 @@ def process_results(json_str, fmea_rows):
             f"{covered} Covered, {partial} Partial, {not_covered} Not covered."
         )
 
-        save_excel(analysis)
+        gaps = data.get("gaps", [])
+        excesses = data.get("excesses", [])
+        recommendations = data.get("recommendations", "")
+
+        # Fallback: build gaps list from Not covered items if AI didn't provide it
+        if not gaps:
+            gaps = [
+                {
+                    "maintainable_item": e["maintainable_item"],
+                    "failure_mechanism": e["failure_mechanism"],
+                    "recommendation": "No recommendation provided.",
+                }
+                for e in analysis
+                if e.get("coverage") == "Not covered"
+            ]
+
+        print(f"  Gaps: {len(gaps)}, Excesses: {len(excesses)}")
+        save_excel(analysis, gaps=gaps, excesses=excesses, recommendations=recommendations)
 
     except json.JSONDecodeError:
         print("Error: API response is not valid JSON.")
@@ -339,10 +616,13 @@ def process_results(json_str, fmea_rows):
 # --- Main ---
 def main():
     print("--- FMEA Coverage Analysis with DeepSeek Reasoner ---")
-    df_wi, df_fmea = load_data()
-    fmea_rows = extract_fmea_rows(df_fmea)
+    wi_files, df_fmea = load_data()
+    wi_questions = prepare_wi_questions(wi_files)
+    print(f"✓ Prepared {len(wi_questions)} Work Instruction questions with IDs.")
+    component_symptoms = extract_fmea_component_symptoms(df_fmea)
+    fmea_rows = extract_fmea_rows(df_fmea, component_symptoms)
     print(f"✓ Extracted {len(fmea_rows)} FMEA component/mechanism pairs.")
-    prompt = build_prompt(df_wi, fmea_rows)
+    prompt = build_prompt(wi_questions, fmea_rows)
     result_json = call_deepseek(prompt)
     process_results(result_json, fmea_rows)
     print("--- Analysis finished ---")
